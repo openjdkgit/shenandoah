@@ -207,7 +207,6 @@ bool ShenandoahConcurrentGC::collect(GCCause::Cause cause) {
     if (check_cancellation_and_abort(ShenandoahDegenPoint::_degenerated_updaterefs)) {
       return false;
     }
-
     vmop_entry_final_updaterefs();
 
     // Update references freed up collection set, kick the cleanup to reclaim the space.
@@ -217,8 +216,8 @@ bool ShenandoahConcurrentGC::collect(GCCause::Cause cause) {
     // do not check for cancellation here because, at this point, the cycle is effectively
     // complete. If the cycle has been cancelled here, the control thread will detect it
     // on its next iteration and run a degenerated young cycle.
-    vmop_entry_final_roots();
     _abbreviated = true;
+    vmop_entry_final_roots();
   }
 
   // We defer generation resizing actions until after cset regions have been recycled.  We do this even following an
@@ -329,8 +328,14 @@ void ShenandoahConcurrentGC::entry_final_roots() {
   static const char* msg = "Pause Final Roots";
   ShenandoahPausePhase gc_phase(msg, ShenandoahPhaseTimings::final_roots);
   EventMark em("%s", msg);
-
+  ShenandoahHeap* const heap = ShenandoahHeap::heap();
   op_final_roots();
+  // After concurrent old marking finishes and after an abbreviated cycle, we reclaim immediate garbage.
+  // Further, we may also want to expand OLD in order to make room for anticipated promotions and/or for mixed
+  // evacuations.  Mixed evacuations are especially likely to following the end of OLD marking.
+  assert(_abbreviated || (heap->mode()->is_generational() && _generation->is_old()),
+         "Only rebuild free set for abbreviated and old-marking cycles");
+  heap->rebuild_free_set(true /*concurrent*/);
 }
 
 void ShenandoahConcurrentGC::entry_reset() {
@@ -683,31 +688,7 @@ void ShenandoahConcurrentGC::op_final_mark() {
     JvmtiTagMap::set_needs_cleaning();
 
     // The collection set is chosen by prepare_regions_and_collection_set().
-    //
-    // TODO: Under severe memory overload conditions that can be checked here, we may want to limit
-    // the inclusion of old-gen candidates within the collection set.  This would allow us to prioritize efforts on
-    // evacuating young-gen,  This remediation is most appropriate when old-gen availability is very high (so there
-    // are negligible negative impacts from delaying completion of old-gen evacuation) and when young-gen collections
-    // are "under duress" (as signalled by very low availability of memory within young-gen, indicating that/ young-gen
-    // collections are not triggering frequently enough).
     _generation->prepare_regions_and_collection_set(true /*concurrent*/);
-
-    // Upon return from prepare_regions_and_collection_set(), certain parameters have been established to govern the
-    // evacuation efforts that are about to begin.  In particular:
-    //
-    // heap->get_promoted_reserve() represents the amount of memory within old-gen's available memory that has
-    //   been set aside to hold objects promoted from young-gen memory.  This represents an estimated percentage
-    //   of the live young-gen memory within the collection set.  If there is more data ready to be promoted than
-    //   can fit within this reserve, the promotion of some objects will be deferred until a subsequent evacuation
-    //   pass.
-    //
-    // heap->get_old_evac_reserve() represents the amount of memory within old-gen's available memory that has been
-    //  set aside to hold objects evacuated from the old-gen collection set.
-    //
-    // heap->get_young_evac_reserve() represents the amount of memory within young-gen's available memory that has
-    //  been set aside to hold objects evacuated from the young-gen collection set.  Conservatively, this value
-    //  equals the entire amount of live young-gen memory within the collection set, even though some of this memory
-    //  will likely be promoted.
 
     // Has to be done after cset selection
     heap->prepare_concurrent_roots();
@@ -1162,7 +1143,6 @@ void ShenandoahConcurrentGC::op_final_updaterefs() {
   if (VerifyAfterGC) {
     Universe::verify();
   }
-
   heap->rebuild_free_set(true /*concurrent*/);
 }
 
